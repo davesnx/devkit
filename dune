@@ -9,6 +9,9 @@
   (public_name devkit.core)
   (libraries
     threads.posix ; must come first
+    ache
+    ache-lwt
+    bigstringaf
     curl
     curl.lwt
     extlib

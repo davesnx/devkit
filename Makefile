@@ -1,5 +1,5 @@
 
-.PHONY: build lib doc clean install uninstall test benchs gen gen_ragel gen_metaocaml archive
+.PHONY: build lib doc clean install uninstall test benchs bench-httpev gen gen_ragel gen_metaocaml archive
 
 OCAMLBUILD=ocamlbuild -use-ocamlfind -no-links -j 0
 
@@ -29,6 +29,9 @@ test:
 
 benchs:
 		RUN_BENCHS=1 dune exec --profile bench $(DUNEFLAGS) bench/bench_sharded_hash_trie.exe
+
+bench-httpev:
+		sh bench/httpev_server.sh
 
 doc:
 		dune build $(DUNEFLAGS) @doc
