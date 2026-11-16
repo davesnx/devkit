@@ -251,7 +251,7 @@ let live_words () =
   Gc.full_major ();
   (Gc.stat ()).live_words
 
-let check_keep_alive_timers_bounded ~request ~body =
+let check_timers_bounded ~exchange =
   let requests = 10_000 in
   let previous = Lwt_engine.get () in
   Lwt_engine.set ~destroy:false (new Lwt_engine.select);
@@ -260,15 +260,8 @@ let check_keep_alive_timers_bounded ~request ~body =
     Lwt_main.run @@ Lwt_unix.with_timeout 60. @@ fun () ->
     with_server @@ fun addr ->
     let live_sleeper = Lwt_unix.sleep 20. in
-    with_connection addr @@ fun ic oc ->
-    let rec exchanges n =
-      if n = 0 then Lwt.return_unit
-      else
-        let* () = send oc request in
-        let* r = read_response ic in
-        assert_response ~status:200 ~body r;
-        exchanges (n - 1)
-    in
+    exchange addr @@ fun exchange ->
+    let rec exchanges n = if n = 0 then Lwt.return_unit else Lwt.bind (exchange ()) (fun () -> exchanges (n - 1)) in
     let* () = exchanges (requests / 10) in
     let before = live_words () in
     let* () = exchanges requests in
@@ -278,9 +271,37 @@ let check_keep_alive_timers_bounded ~request ~body =
   in
   if growth > requests then OUnit2.assert_failure (sprintf "heap grew by %d words over %d requests" growth requests)
 
-let test_keep_alive_get_timers_bounded _ = check_keep_alive_timers_bounded ~request:(get "/hello") ~body:"hello"
+let keep_alive ~request ~body addr f =
+  with_connection addr @@ fun ic oc ->
+  f @@ fun () ->
+  let* () = send oc request in
+  let* r = read_response ic in
+  assert_response ~status:200 ~body r;
+  Lwt.return_unit
 
-let test_keep_alive_post_timers_bounded _ = check_keep_alive_timers_bounded ~request:(post_echo "a=1") ~body:"a=1|a=1"
+let new_connections ~request ~body addr f =
+  f @@ fun () ->
+  with_connection addr @@ fun ic oc ->
+  let* () = send oc request in
+  let* r = read_response ic in
+  assert_response ~status:200 ~body r;
+  assert_closed ic
+
+let test_keep_alive_get_timers_bounded _ = check_timers_bounded ~exchange:(keep_alive ~request:(get "/hello") ~body:"hello")
+
+let test_keep_alive_post_timers_bounded _ =
+  check_timers_bounded ~exchange:(keep_alive ~request:(post_echo "a=1") ~body:"a=1|a=1")
+
+let test_close_get_timers_bounded _ =
+  check_timers_bounded
+    ~exchange:(new_connections ~request:"GET /hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" ~body:"hello")
+
+let test_close_post_timers_bounded _ =
+  check_timers_bounded
+    ~exchange:
+      (new_connections
+         ~request:"POST /echo HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 3\r\n\r\na=1"
+         ~body:"a=1|a=1")
 
 let () =
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
@@ -301,4 +322,6 @@ let () =
              "body_timeout" >:: test_body_timeout;
              "keep_alive_get_timers_bounded" >:: test_keep_alive_get_timers_bounded;
              "keep_alive_post_timers_bounded" >:: test_keep_alive_post_timers_bounded;
+             "close_get_timers_bounded" >:: test_close_get_timers_bounded;
+             "close_post_timers_bounded" >:: test_close_post_timers_bounded;
            ])

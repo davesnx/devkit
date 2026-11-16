@@ -988,18 +988,60 @@ let read_body reqd limit =
     Ache.Body.Reader.schedule_read body ~on_eof ~on_error ~on_read;
     p
 
-type body_deadline = { mutable at : float; mutable timer : unit Lwt.t }
+type body_deadline = {
+  queue : body_deadlines;
+  mutable at : float;
+  mutable prev : body_deadline;
+  mutable next : body_deadline;
+  mutable expired : unit Lwt.t * unit Lwt.u;
+}
 
-let new_body_deadline () = { at = 0.; timer = Lwt.return_unit }
+and body_deadlines = { seconds : float; root : body_deadline; mutable sleeping : bool }
 
-let rec sleep_until_deadline d =
-  let left = d.at -. Unix.gettimeofday () in
-  if left > 0. then Lwt.bind (Lwt_unix.sleep left) (fun () -> sleep_until_deadline d) else Lwt.return_unit
+let new_body_deadlines seconds =
+  let rec queue = { seconds; root; sleeping = false }
+  and root = { queue; at = infinity; prev = root; next = root; expired = Lwt.wait () } in
+  queue
 
-let wait_body_deadline d seconds =
-  d.at <- Unix.gettimeofday () +. seconds;
-  if not (Lwt.is_sleeping d.timer) then d.timer <- sleep_until_deadline d;
-  Lwt.protected d.timer
+let new_body_deadline queue =
+  let rec d = { queue; at = 0.; prev = d; next = d; expired = Lwt.wait () } in
+  d
+
+let stop_body_deadline d =
+  d.prev.next <- d.next;
+  d.next.prev <- d.prev;
+  d.prev <- d;
+  d.next <- d
+
+let rec expire_body_deadlines queue () =
+  let now = Unix.gettimeofday () in
+  let rec expire () =
+    let d = queue.root.next in
+    if d != queue.root && d.at <= now then begin
+      stop_body_deadline d;
+      Lwt.wakeup_later (snd d.expired) ();
+      expire ()
+    end
+  in
+  expire ();
+  let front = queue.root.next in
+  if front == queue.root then queue.sleeping <- false
+  else Lwt.on_success (Lwt_unix.sleep (front.at -. now)) (expire_body_deadlines queue)
+
+let wait_body_deadline d =
+  let queue = d.queue in
+  stop_body_deadline d;
+  if not (Lwt.is_sleeping (fst d.expired)) then d.expired <- Lwt.wait ();
+  d.at <- Unix.gettimeofday () +. queue.seconds;
+  d.prev <- queue.root.prev;
+  d.next <- queue.root;
+  queue.root.prev.next <- d;
+  queue.root.prev <- d;
+  if not queue.sleeping then begin
+    queue.sleeping <- true;
+    Lwt.on_success (Lwt_unix.sleep queue.seconds) (expire_body_deadlines queue)
+  end;
+  Lwt.protected (fst d.expired)
 
 let send_reply c reqd req reply =
   let (code,hdrs,body) = match reply with
@@ -1073,7 +1115,7 @@ let handle_request_ache server fd deadline sockaddr answer reqd =
       | _ ->
         Lwt.pick [
           read_body reqd cfg.max_request_size;
-          (let%lwt () = wait_body_deadline deadline cfg.max_time.body in Lwt.return (Error `Timeout));
+          (let%lwt () = wait_body_deadline deadline in Lwt.return (Error `Timeout));
         ]
     in
     match body with
@@ -1175,6 +1217,7 @@ let setup_fd_lwt fd config answer =
   let server = make_server_state (Lwt_unix.unix_file_descr fd (* will not be used *) ) config in
   let ache_config = { Ache.Config.default with max_header_size = config.max_request_size } in
   let timeout = if config.max_time.headers > 0. then Some config.max_time.headers else None in
+  let body_deadlines = new_body_deadlines config.max_time.body in
   Lwt.ignore_result begin
     while%lwt true do
       let%lwt () = Lwt_unix.sleep @@ Time.minutes 1 in
@@ -1191,14 +1234,14 @@ let setup_fd_lwt fd config answer =
     | false ->
       if config.debug then log #info "accepted %s" (Nix.show_addr sockaddr);
       incr_active server;
-      let deadline = new_body_deadline () in
+      let deadline = new_body_deadline body_deadlines in
       begin
         if config.nodelay then Lwt_unix.setsockopt fd TCP_NODELAY true;
         Ache_lwt.Server.create_connection_handler ~config:ache_config ?idle_timeout:timeout ?head_timeout:timeout
           ~request_handler:(fun sockaddr reqd -> handle_request_ache server fd deadline sockaddr answer reqd)
           ~error_handler:(ache_error_handler server) sockaddr fd
       end [%lwt.finally
-        Lwt.cancel deadline.timer;
+        stop_body_deadline deadline;
         decr_active server;
         match Lwt_unix.state fd with
         | Lwt_unix.Closed -> Lwt.return_unit
