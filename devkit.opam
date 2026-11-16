@@ -33,7 +33,6 @@ depends: [
   "yojson" {>= "1.6.0"}
   "ache"
   "ache-lwt"
-  "bigstringaf"
   "odoc" {with-doc}
 ]
 depopts: [
@@ -46,7 +45,7 @@ conflicts: [
   "opentelemetry" {< "0.92"}
 ]
 pin-depends: [
-  ["ache.dev" "git+https://github.com/davesnx/ache.git#977c4452237ab24f761a6118855c6abd9b988646"]
-  ["ache-lwt.dev" "git+https://github.com/davesnx/ache.git#977c4452237ab24f761a6118855c6abd9b988646"]
+  ["ache.dev" "git+https://github.com/davesnx/ache.git#d05c15dccdc9a39ca5b1abb6087c4bc2a9770f75"]
+  ["ache-lwt.dev" "git+https://github.com/davesnx/ache.git#d05c15dccdc9a39ca5b1abb6087c4bc2a9770f75"]
 ]
 available: arch != "arm32" & arch != "x86_32"

@@ -225,11 +225,62 @@ let test_head_timeout_drop _ =
   let* () = send oc "GET /hello HTTP/1.1\r\n" in
   assert_closed ic
 
+let test_body_timeout _ =
+  run @@ fun () ->
+  with_server ~config:(fun c -> { c with max_time = { c.max_time with body = 0.3 } }) @@ fun addr ->
+  with_connection addr @@ fun ic oc ->
+  let* () = send oc (post_echo "a=1") in
+  let* r = read_response ic in
+  assert_response ~status:200 ~body:"a=1|a=1" r;
+  let* () = Lwt_unix.sleep 0.2 in
+  let since = Unix.gettimeofday () in
+  let* () = send oc "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n\r\na=1" in
+  let* r = read_response ic in
+  let elapsed = Unix.gettimeofday () -. since in
+  assert_response ~status:400 ~body:"" ~headers:[ "connection", "close" ] r;
+  if elapsed < 0.25 || elapsed > 1. then OUnit2.assert_failure (sprintf "body timeout after %.3f s, not 0.3 s" elapsed);
+  Lwt.return_unit
+
 let test_malformed _ =
   run @@ fun () ->
   let* r = exchange "GARBAGE\r\n\r\n" in
   assert_response ~status:400 ~body:"" ~headers:[ "connection", "close" ] r;
   Lwt.return_unit
+
+let live_words () =
+  Gc.full_major ();
+  (Gc.stat ()).live_words
+
+let check_keep_alive_timers_bounded ~request ~body =
+  let requests = 10_000 in
+  let previous = Lwt_engine.get () in
+  Lwt_engine.set ~destroy:false (new Lwt_engine.select);
+  let growth =
+    Fun.protect ~finally:(fun () -> Lwt_engine.set previous) @@ fun () ->
+    Lwt_main.run @@ Lwt_unix.with_timeout 60. @@ fun () ->
+    with_server @@ fun addr ->
+    let live_sleeper = Lwt_unix.sleep 20. in
+    with_connection addr @@ fun ic oc ->
+    let rec exchanges n =
+      if n = 0 then Lwt.return_unit
+      else
+        let* () = send oc request in
+        let* r = read_response ic in
+        assert_response ~status:200 ~body r;
+        exchanges (n - 1)
+    in
+    let* () = exchanges (requests / 10) in
+    let before = live_words () in
+    let* () = exchanges requests in
+    let growth = live_words () - before in
+    Lwt.cancel live_sleeper;
+    Lwt.return growth
+  in
+  if growth > requests then OUnit2.assert_failure (sprintf "heap grew by %d words over %d requests" growth requests)
+
+let test_keep_alive_get_timers_bounded _ = check_keep_alive_timers_bounded ~request:(get "/hello") ~body:"hello"
+
+let test_keep_alive_post_timers_bounded _ = check_keep_alive_timers_bounded ~request:(post_echo "a=1") ~body:"a=1|a=1"
 
 let () =
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
@@ -247,4 +298,7 @@ let () =
              "single" >:: test_single;
              "head_chunks" >:: test_head_chunks;
              "head_timeout_drop" >:: test_head_timeout_drop;
+             "body_timeout" >:: test_body_timeout;
+             "keep_alive_get_timers_bounded" >:: test_keep_alive_get_timers_bounded;
+             "keep_alive_post_timers_bounded" >:: test_keep_alive_post_timers_bounded;
            ])

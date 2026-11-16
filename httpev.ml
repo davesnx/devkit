@@ -980,13 +980,26 @@ let read_body reqd limit =
         Lwt.wakeup_later u (Error `Too_large)
       end
       else begin
-        Buffer.add_string buf (Bigstringaf.substring bs ~off ~len);
+        Buffer.add_string buf (Ache.Bigstring.substring bs ~off ~len);
         Ache.Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
       end
     and on_eof () = Lwt.wakeup_later u (Ok (Buffer.contents buf))
     and on_error () = Lwt.wakeup_later u (Error `Incomplete) in
     Ache.Body.Reader.schedule_read body ~on_eof ~on_error ~on_read;
     p
+
+type body_deadline = { mutable at : float; mutable timer : unit Lwt.t }
+
+let new_body_deadline () = { at = 0.; timer = Lwt.return_unit }
+
+let rec sleep_until_deadline d =
+  let left = d.at -. Unix.gettimeofday () in
+  if left > 0. then Lwt.bind (Lwt_unix.sleep left) (fun () -> sleep_until_deadline d) else Lwt.return_unit
+
+let wait_body_deadline d seconds =
+  d.at <- Unix.gettimeofday () +. seconds;
+  if not (Lwt.is_sleeping d.timer) then d.timer <- sleep_until_deadline d;
+  Lwt.protected d.timer
 
 let send_reply c reqd req reply =
   let (code,hdrs,body) = match reply with
@@ -1041,7 +1054,7 @@ let handle_request_lwt c req answer =
     log #info "version %u.%u not supported from %s" (fst req.version) (snd req.version) (show_request req) ~structured_pairs:(pairs_of_request req);
     return (`Version_not_supported,[],"HTTP/1.0 is supported")
 
-let handle_request_ache server fd sockaddr answer reqd =
+let handle_request_ache server fd deadline sockaddr answer reqd =
   let cfg = server.config in
   let ache_req = Ache.Reqd.request reqd in
   incr_total server;
@@ -1055,8 +1068,13 @@ let handle_request_ache server fd sockaddr answer reqd =
   let headers = List.map (fun (n,v) -> String.lowercase_ascii n, String.strip v) (Ache.Headers.to_list ache_req.headers) in
   let process () =
     let%lwt body =
-      try%lwt Lwt_unix.with_timeout cfg.max_time.body (fun () -> read_body reqd cfg.max_request_size)
-      with Lwt_unix.Timeout -> Lwt.return (Error `Timeout)
+      match Ache.Request.body_length ache_req with
+      | `Fixed 0L -> Lwt.return (Ok "")
+      | _ ->
+        Lwt.pick [
+          read_body reqd cfg.max_request_size;
+          (let%lwt () = wait_body_deadline deadline cfg.max_time.body in Lwt.return (Error `Timeout));
+        ]
     in
     match body with
     | Error `Incomplete -> Lwt.return_unit
@@ -1173,12 +1191,14 @@ let setup_fd_lwt fd config answer =
     | false ->
       if config.debug then log #info "accepted %s" (Nix.show_addr sockaddr);
       incr_active server;
+      let deadline = new_body_deadline () in
       begin
         if config.nodelay then Lwt_unix.setsockopt fd TCP_NODELAY true;
         Ache_lwt.Server.create_connection_handler ~config:ache_config ?idle_timeout:timeout ?head_timeout:timeout
-          ~request_handler:(fun sockaddr reqd -> handle_request_ache server fd sockaddr answer reqd)
+          ~request_handler:(fun sockaddr reqd -> handle_request_ache server fd deadline sockaddr answer reqd)
           ~error_handler:(ache_error_handler server) sockaddr fd
       end [%lwt.finally
+        Lwt.cancel deadline.timer;
         decr_active server;
         match Lwt_unix.state fd with
         | Lwt_unix.Closed -> Lwt.return_unit
