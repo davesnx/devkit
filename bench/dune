@@ -1,6 +1,13 @@
 ; optional: needs saturn and benchmark. Build with make benchs.
 (executable
  (name bench_sharded_hash_trie)
+ (modules bench_sharded_hash_trie)
  (optional)
  (enabled_if (= %{profile} bench))
  (libraries devkit saturn benchmark unix))
+
+; Run with make bench-httpev, see README.md.
+(executable
+ (name httpev_server)
+ (modules httpev_server)
+ (libraries devkit unix))

@@ -11,7 +11,7 @@ build: [
   ["dune" "build" "-p" name "-j" jobs "@install" "@runtest"{with-test} "@doc"{with-doc}]
 ]
 depends: [
-  "ocaml" {>= "5.0"}
+  "ocaml" {>= "5.3"}
   "dune" {>= "2.3"}
   ("extlib" {>= "1.7.1"} | "extlib-compat" {>= "1.7.1"})
   "ounit2"
@@ -31,6 +31,8 @@ depends: [
   "base-threads"
   "stdlib-shims"
   "yojson" {>= "1.6.0"}
+  "ache"
+  "ache-lwt"
   "odoc" {with-doc}
 ]
 depopts: [
@@ -41,5 +43,9 @@ depopts: [
 conflicts: [
   "jemalloc" {< "0.2"}
   "opentelemetry" {< "0.92"}
+]
+pin-depends: [
+  ["ache.dev" "git+https://github.com/davesnx/ache.git#722caa5ca013ebeda78fea77e7cce2de1cd10dfb"]
+  ["ache-lwt.dev" "git+https://github.com/davesnx/ache.git#722caa5ca013ebeda78fea77e7cce2de1cd10dfb"]
 ]
 available: arch != "arm32" & arch != "x86_32"

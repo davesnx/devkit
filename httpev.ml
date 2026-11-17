@@ -6,8 +6,6 @@ module Ev = Libevent
 
 open Prelude
 
-let buffer_size = 4096
-
 (* hide log *)
 module Hidden = struct let log = Log.from "httpev" end
 open Hidden
@@ -651,34 +649,6 @@ let handle events fd k =
   in
   setup ()
 
-let handle_lwt ?(single=false) fd k =
-  match%lwt Exn_lwt.map Lwt_unix.accept fd with
-  | `Exn (Unix.Unix_error (Unix.EMFILE,_,_)) ->
-    let pause = 2. in
-    log #error "too many open files, disabling accept for %s" (Time.duration_str pause);
-    Lwt_unix.sleep pause
-  | `Exn (Lwt.Canceled as exn) -> log #info "canceling accept loop"; Lwt.reraise exn
-  | `Exn exn -> log #warn ~exn "accept"; Lwt.return_unit
-  | `Ok (fd,addr as peer) ->
-    let task =
-      begin
-        try%lwt
-        Unix.set_close_on_exec (Lwt_unix.unix_file_descr fd);
-        k peer
-        with exn -> log #warn ~exn "accepted (%s)" (Nix.show_addr addr); Lwt.return_unit
-      end [%lwt.finally
-        Lwt_unix.(Exn.suppress (shutdown fd) SHUTDOWN_ALL);
-        Lwt_unix.close fd
-      ]
-    in
-    if single then
-      task
-    else
-    begin
-      Lwt.ignore_result task; (* "fork" processing *)
-      Lwt.return_unit
-    end
-
 end
 
 let check_hung_requests server =
@@ -957,23 +927,8 @@ let answer_forked ?debug srv req answer k =
 
 (** {2 Lwt support} *)
 
-let timeout tm thread = Lwt_unix.with_timeout tm (fun () -> thread)
-
-let send_reply c cout reply =
-  (* repack *)
-  let (code,hdrs,body) = match reply with
-  | `Body (code,hdrs,s) -> code, hdrs, `Body s
-  | `Chunks (code,hdrs,gen) -> code, hdrs, `Chunks gen
-  in
-  let hdrs = maybe_allow_cors c hdrs in
-  begin match c.req with
-  | Ready req ->
-    let size = match body with `Body s -> String.length s | `Chunks _ -> 0 in
-    if c.server.config.access_log_enabled then emit_accesslog !(c.server.config.access_log) code size req
-  | _ -> () (* this can happen when sending back error reply on malformed HTTP input *)
-  end;
-  (* filter headers *)
-  let hdrs = hdrs |> List.filter begin fun (k,v) ->
+let filter_reply_headers hdrs =
+  hdrs |> List.filter begin fun (k,v) ->
     let open Stre in
     let forbidden =
       (iequal k "content-length") || (* httpev will calculate *)
@@ -983,50 +938,91 @@ let send_reply c cout reply =
     in
     not forbidden
   end
+
+let ache_status = function
+  | `Custom line ->
+    begin
+      try Scanf.sscanf line "HTTP/%_d.%_d %d %[^\r\n]" (fun code reason -> Ache.Status.of_code code, Some reason)
+      with _ ->
+        log #warn "bad custom status line %S" line;
+        `Internal_server_error, None
+    end
+  | #status_code as code -> Ache.Status.of_code (status_code code), None
+
+let ache_response ?(close=false) code (hdrs : (string * string) list) =
+  let status, reason = ache_status code in
+  let hdrs = if close then hdrs @ ["Connection", "close"] else hdrs in
+  Ache.Response.create ?reason ~headers:(Ache.Headers.of_list hdrs) status
+
+let respond_empty ?close reqd code = Ache.Reqd.respond_with_string reqd (ache_response ?close code []) ""
+
+exception Drop_connection
+
+let drop_connection reqd = Ache.Reqd.report_exn reqd Drop_connection
+
+let flush_writer writer =
+  let (p,u) = Lwt.wait () in
+  Ache.Body.Writer.flush writer (function
+    | `Written -> Lwt.wakeup_later u ()
+    | `Closed -> Lwt.wakeup_later_exn u (Failure "connection closed"));
+  p
+
+let read_body reqd limit =
+  match Ache.Request.body_length (Ache.Reqd.request reqd) with
+  | `Fixed n when Int64.compare n (Int64.of_int limit) > 0 -> Lwt.return (Error `Too_large)
+  | _ ->
+    let body = Ache.Reqd.request_body reqd in
+    let buf = Buffer.create 0 in
+    let (p,u) = Lwt.wait () in
+    let rec on_read bs ~off ~len =
+      if Buffer.length buf + len > limit then begin
+        Ache.Body.Reader.close body;
+        Lwt.wakeup_later u (Error `Too_large)
+      end
+      else begin
+        Buffer.add_string buf (Ache.Bigstring.substring bs ~off ~len);
+        Ache.Body.Reader.schedule_read body ~on_eof ~on_error ~on_read
+      end
+    and on_eof () = Lwt.wakeup_later u (Ok (Buffer.contents buf))
+    and on_error () = Lwt.wakeup_later u (Error `Incomplete) in
+    Ache.Body.Reader.schedule_read body ~on_eof ~on_error ~on_read;
+    p
+
+let wait_body_deadline = function
+  | None -> Lwt.pause ()
+  | Some t -> Ache_lwt.Timeout.set t; Ache_lwt.Timeout.expired t
+
+let send_reply c reqd req reply =
+  let (code,hdrs,body) = match reply with
+  | `Body (code,hdrs,s) -> code, hdrs, `Body s
+  | `Chunks (code,hdrs,gen) -> code, hdrs, `Chunks gen
   in
-  (* possibly apply encoding *)
-  let (hdrs,body) =
-    (* TODO gzip + chunked? *)
-    match body, code, c.req with
-    | `Body s, `Ok, Ready { encoding; _ } ->
-      let hdrs, s = maybe_gzip encoding hdrs s in
-      hdrs, `Body s
-    | _ -> hdrs, body
-  in
-  let hdrs = match body with
-  | `Body s -> ("Content-Length", string_of_int (String.length s)) :: hdrs
-  | `Chunks _ -> ("Transfer-Encoding", "chunked") :: hdrs
-  in
-  (* do not transfer body for HEAD requests *)
-  let body = match c.req with Ready { meth = `HEAD; _ } -> `Body "" | _ -> body in
-  let version = match body with `Body _ -> `Http_1_0 | `Chunks _ -> `Http_1_1 in
-  let headers = make_request_headers ~version code hdrs in
-  if c.server.config.debug then
-    log #info "will answer to %s with %d+%s bytes"
-      (show_peer c)
-      (String.length headers)
-      (match body with `Body s -> sprintf "%d" (String.length s) | `Chunks _ -> "...");
-  let%lwt () = Lwt_io.write cout headers in
-  let%lwt () =
-    match body with
-    | `Body s -> Lwt_io.write cout s
-    | `Chunks gen ->
-      let push = function
-      | "" -> Lwt.return_unit
-      | s ->
-        let%lwt () = Lwt_io.write cout (sprintf "%x\r\n" (String.length s)) in
-        let%lwt () = Lwt_io.write cout s in
-        Lwt_io.write cout "\r\n"
-      in
-      try%lwt
-        let%lwt () = gen push in
-        Lwt_io.write cout "0\r\n\r\n"
-      with exn ->
-        (* do not write trailer on error - let the peer notice the breakage *)
-        log #warn ~exn "generate failed";
-        Lwt.return_unit
-  in
-  Lwt_io.flush cout
+  let body = match req.meth with `HEAD -> `Body "" | _ -> body in
+  let close = c.server.config.single in
+  let hdrs = maybe_allow_cors c hdrs in
+  let size = match body with `Body s -> String.length s | `Chunks _ -> 0 in
+  if c.server.config.access_log_enabled then emit_accesslog !(c.server.config.access_log) code size req;
+  let hdrs = filter_reply_headers hdrs in
+  match body with
+  | `Body s ->
+    let (hdrs,s) = match code with `Ok -> maybe_gzip req.encoding hdrs s | _ -> hdrs, s in
+    Ache.Reqd.respond_with_string reqd (ache_response ~close code hdrs) s;
+    Lwt.return_unit
+  | `Chunks gen ->
+    let writer = Ache.Reqd.respond_with_streaming reqd (ache_response ~close code hdrs) in
+    let push = function
+    | "" -> Lwt.return_unit
+    | s -> Ache.Body.Writer.write_string writer s; flush_writer writer
+    in
+    try%lwt
+      let%lwt () = gen push in
+      Ache.Body.Writer.close writer;
+      Lwt.return_unit
+    with exn ->
+      (* do not write trailer on error - let the peer notice the breakage *)
+      log #warn ~exn "generate failed";
+      Ache.Reqd.report_exn reqd exn;
+      Lwt.return_unit
 
 let handle_request_lwt c req answer =
   let return x = Lwt.return @@ `Body x in
@@ -1049,66 +1045,112 @@ let handle_request_lwt c req answer =
     log #info "version %u.%u not supported from %s" (fst req.version) (snd req.version) (show_request req) ~structured_pairs:(pairs_of_request req);
     return (`Version_not_supported,[],"HTTP/1.0 is supported")
 
-let read_buf ic buf =
-  let len = Bytes.length buf in
-  let%lwt real_len = Lwt_io.read_into ic buf 0 len in
-  if real_len < len then
-    Lwt.return Bytes.(sub buf 0 real_len |> unsafe_to_string)
-  else
-    Lwt.return (Bytes.unsafe_to_string buf)
-
-module ReqBuffersCache = Cache.Reuse(struct type t = Bytes.t let create () = Bytes.create 2048 let reset = ignore end)
-
-let read_headers cin limit =
-  let rec loop ?acc temp =
-    match acc with
-    | Some acc when String.length acc >= limit -> Exn_lwt.fail "request larger than max_request_size %s" (Action.bytes_string limit)
-    | _ ->
-      match%lwt read_buf cin temp with
-      | "" -> Exn_lwt.fail "client disconnected prior to sending full request"
-      | buf ->
-      let acc = match acc with None -> buf | Some acc -> acc ^ buf in
-      match String.split acc "\r\n\r\n" with
-      | exception _ -> loop ~acc (if acc == Bytes.unsafe_to_string temp then Bytes.create 2048 else temp)
-      | (headers,body) -> Lwt.return (String.nsplit headers "\r\n", body)
+let handle_request_ache server fd deadline sockaddr answer reqd =
+  let cfg = server.config in
+  let ache_req = Ache.Reqd.request reqd in
+  incr_total server;
+  let req_id = server.total in
+  let client = { fd = Lwt_unix.unix_file_descr fd; req_id; sockaddr; time_conn = Time.get (); server; req = Body_lwt 0 } in
+  Hashtbl.replace server.clients req_id client;
+  let line1 =
+    sprintf "%s %s HTTP/%d.%d"
+      (Ache.Method.to_string ache_req.meth) ache_req.target ache_req.version.major ache_req.version.minor
   in
-  let temp = ReqBuffersCache.get () in
-  (loop temp)[%lwt.finally ReqBuffersCache.release temp; Lwt.return_unit]
-
-let handle_client_lwt client cin answer =
-  let cfg = client.server.config in
-  let%lwt (headers,data) = timeout cfg.max_time.headers (read_headers cin cfg.max_request_size) in
-  match headers with
-  | [] -> failed RequestLine "missing"
-  | line1::headers ->
-  let headers = List.map extract_header headers in
-  let content_length = get_content_length headers in
-  (* TODO transfer-encoding *)
-  if List.mem_assoc "transfer-encoding" headers then Exn.fail "Transfer-Encoding not supported";
-  let%lwt data =
-    match content_length with
-    | None when data = "" -> Lwt.return ""
-    | None -> failed Extra data
-    | Some n when String.length data > n -> failed Extra (Stre.slice ~first:n data)
-    | Some n when String.length data = n -> Lwt.return data
-    | Some n ->
-      let s = Bytes.create (n - String.length data) in
-      let%lwt () = timeout cfg.max_time.body (Lwt_io.read_into_exactly cin s 0 (n - String.length data)) in
-      Lwt.return (data ^ Bytes.unsafe_to_string s)
+  let headers = List.map (fun (n,v) -> String.lowercase_ascii n, String.strip v) (Ache.Headers.to_list ache_req.headers) in
+  let process () =
+    let%lwt body =
+      match Ache.Request.body_length ache_req with
+      | `Fixed 0L -> Lwt.return (Ok "")
+      | _ ->
+        Lwt.pick [
+          read_body reqd cfg.max_request_size;
+          (let%lwt () = wait_body_deadline deadline in Lwt.return (Error `Timeout));
+        ]
+    in
+    match body with
+    | Error `Incomplete -> Lwt.return_unit
+    | Error `Too_large ->
+      incr_errors server;
+      log #info "request too large from %s" (show_peer client);
+      respond_empty ~close:true reqd `Request_too_large;
+      Lwt.return_unit
+    | Error `Timeout ->
+      incr_errors server;
+      log #info "body timeout from %s" (show_peer client);
+      begin match cfg.on_recv_timeout with
+      | `Reply_bad_request -> respond_empty ~close:true reqd `Bad_request
+      | `Drop_connection -> drop_connection reqd
+      end;
+      Lwt.return_unit
+    | Ok body ->
+      match make_request_exn ~line1 ~headers ~body client with
+      | exception exn ->
+        incr_errors server;
+        let (http_error,msg) = make_error exn in
+        log #warn "error for %s : %s" (show_peer client) msg;
+        respond_empty ~close:cfg.single reqd http_error;
+        Lwt.return_unit
+      | req ->
+        client.req <- Ready req;
+        Hashtbl.replace server.reqs req.id req;
+        let%lwt reply = (handle_request_lwt client req answer)[%lwt.finally Hashtbl.remove server.reqs req.id; Lwt.return_unit] in
+        match reply with
+        | `No_reply -> drop_connection reqd; Lwt.return_unit
+        | `Body _ | `Chunks _ as reply -> send_reply client reqd req reply
   in
-  (* TODO check that no extra bytes arrive *)
-  client.req <- Body_lwt (String.length data);
-  let req = make_request_exn client ~line1 ~headers ~body:data in
-  client.req <- Ready req;
-  Hashtbl.replace client.server.reqs req.id req;
-  (handle_request_lwt client req answer)[%lwt.finally Hashtbl.remove client.server.reqs req.id; Lwt.return_unit; ]
+  Lwt.async begin fun () ->
+    begin
+      try%lwt process () with exn ->
+        log #warn ~exn "request %s" (show_peer client);
+        Ache.Reqd.report_exn reqd exn;
+        Lwt.return_unit
+    end [%lwt.finally
+      Hashtbl.remove server.clients req_id;
+      if cfg.debug then log #info "finished #%d %s" req_id (show_peer client);
+      Lwt.return_unit
+    ]
+  end
+
+let ache_error_handler server sockaddr ?request:_ error start_response =
+  match error, server.config.on_recv_timeout with
+  | `Exn Drop_connection, _ -> raise Drop_connection
+  | `Request_timeout, `Drop_connection ->
+    incr_errors server;
+    log #info "dropped %s : head timeout" (Nix.show_addr sockaddr);
+    raise Drop_connection
+  | _ ->
+    incr_errors server;
+    let reason = match error with `Exn exn -> Exn.str exn | #Ache.Status.standard as s -> Ache.Status.to_string s in
+    log #warn "error for %s : %s" (Nix.show_addr sockaddr) reason;
+    Ache.Body.Writer.close (start_response Ache.Headers.empty)
+
+let accept_lwt config fd k =
+  match%lwt Exn_lwt.map (Lwt_unix.accept ~cloexec:true) fd with
+  | `Exn (Unix.Unix_error (Unix.EMFILE,_,_)) ->
+    let pause = 2. in
+    log #error "too many open files, disabling accept for %s" (Time.duration_str pause);
+    Lwt_unix.sleep pause
+  | `Exn (Lwt.Canceled as exn) -> log #info "canceling accept loop"; Lwt.reraise exn
+  | `Exn exn -> log #warn ~exn "accept"; Lwt.return_unit
+  | `Ok (fd,addr) ->
+    let task =
+      try%lwt k (fd,addr)
+      with exn -> log #warn ~exn "accepted (%s)" (Nix.show_addr addr); Lwt.return_unit
+    in
+    if config.single then
+      task
+    else
+    begin
+      Lwt.async (fun () -> task); (* "fork" processing *)
+      Lwt.return_unit
+    end
 
 let accept_hook = ref (fun () -> ())
 
 let handle_lwt config fd k =
   let rec loop () =
     !accept_hook ();
-    let%lwt () = Tcp.handle_lwt ~single:config.single fd k in
+    let%lwt () = accept_lwt config fd k in
     let%lwt () = if config.yield then Lwt.pause () else Lwt.return_unit in
     loop ()
   in
@@ -1120,10 +1162,10 @@ let handle_lwt config fd k =
   log #info "%s %s exit" config.name (Nix.show_addr config.connection);
   Lwt.return_unit
 
-module BuffersCache = Cache.Reuse(struct type t = Lwt_bytes.t let create () = Lwt_bytes.create buffer_size let reset = ignore end)
-
 let setup_fd_lwt fd config answer =
   let server = make_server_state (Lwt_unix.unix_file_descr fd (* will not be used *) ) config in
+  let ache_config = { Ache.Config.default with max_header_size = config.max_request_size } in
+  let timeout = if config.max_time.headers > 0. then Some config.max_time.headers else None in
   Lwt.ignore_result begin
     while%lwt true do
       let%lwt () = Lwt_unix.sleep @@ Time.minutes 1 in
@@ -1131,53 +1173,28 @@ let setup_fd_lwt fd config answer =
     done
   end;
   handle_lwt config fd begin fun (fd,sockaddr) ->
-    incr_total server;
-    let req_id = server.total in
     match server.active >= config.max_clients with
-    | true -> incr_reject server; if config.debug then log #info "rejected #%d %s" req_id (Nix.show_addr sockaddr); Lwt.return_unit
+    | true ->
+      incr_reject server;
+      if config.debug then log #info "rejected %s" (Nix.show_addr sockaddr);
+      Exn.suppress (Lwt_unix.shutdown fd) Unix.SHUTDOWN_ALL;
+      Lwt_unix.close fd
     | false ->
-    let error = lazy (incr_errors server) in
-    let client =
-      (* used only in show_socket_error *)
-      { fd = Lwt_unix.unix_file_descr fd; req_id; sockaddr; time_conn=Time.get (); server; req=Headers (Buffer.create 0); }
-    in
-    if config.debug then log #info "accepted #%d %s" req_id (Nix.show_addr sockaddr);
-    incr_active server;
-    Hashtbl.replace server.clients req_id client;
-    let buffer = BuffersCache.get () in
-    begin
-      let cin = Lwt_io.(of_fd ~buffer ~close:Lwt.return ~mode:input fd) in
-      let%lwt reply =
-        try%lwt
-          handle_client_lwt client cin answer
-        with exn ->
-        !!error;
-        match exn, config.on_recv_timeout with
-        | Lwt_unix.Timeout, `Drop_connection ->
-          log #info ~exn "dropped #%d %s" req_id (show_client client);
-          Lwt.return `No_reply
-        | exn, _ ->
-          let (http_error,msg) = make_error exn in
-          log #warn "error for %s : %s" (show_client client) msg;
-          Lwt.return @@ `Body (http_error,[],"")
-      in
-      match reply with
-      | `No_reply -> Lwt.return_unit
-      | `Body _ | `Chunks _ as reply ->
-      if config.nodelay then
-        Lwt_unix.setsockopt fd TCP_NODELAY true;
-      (* reusing same buffer! *)
-      let cout = Lwt_io.(of_fd ~buffer ~close:Lwt.return ~mode:output fd) in
-      begin try%lwt
-        match reply with
-        | `Chunks _ -> send_reply client cout reply
-        | _ -> timeout config.max_time.send (send_reply client cout reply)
-      with exn ->
-        !!error;
-        log #warn ~exn "send_reply %s" (show_client client);
-        Lwt.return_unit
-      end
-    end [%lwt.finally decr_active server; Hashtbl.remove server.clients req_id; BuffersCache.release buffer; Lwt.return_unit; ]
+      if config.debug then log #info "accepted %s" (Nix.show_addr sockaddr);
+      incr_active server;
+      let deadline = if config.max_time.body > 0. then Some (Ache_lwt.Timeout.create config.max_time.body) else None in
+      begin
+        if config.nodelay then Lwt_unix.setsockopt fd TCP_NODELAY true;
+        Ache_lwt.Server.create_connection_handler ~config:ache_config ?idle_timeout:timeout ?head_timeout:timeout
+          ~request_handler:(fun sockaddr reqd -> handle_request_ache server fd deadline sockaddr answer reqd)
+          ~error_handler:(ache_error_handler server) sockaddr fd
+      end [%lwt.finally
+        Option.may Ache_lwt.Timeout.stop deadline;
+        decr_active server;
+        match Lwt_unix.state fd with
+        | Lwt_unix.Closed -> Lwt.return_unit
+        | Opened | Aborted _ -> Exn.suppress (Lwt_unix.shutdown fd) Unix.SHUTDOWN_ALL; Lwt_unix.close fd
+      ]
   end
 
 let setup_lwt config answer =
