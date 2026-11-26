@@ -45,7 +45,7 @@ conflicts: [
   "opentelemetry" {< "0.92"}
 ]
 pin-depends: [
-  ["ache.dev" "git+https://github.com/davesnx/ache.git#722caa5ca013ebeda78fea77e7cce2de1cd10dfb"]
-  ["ache-lwt.dev" "git+https://github.com/davesnx/ache.git#722caa5ca013ebeda78fea77e7cce2de1cd10dfb"]
+  ["ache.dev" "git+https://github.com/davesnx/ache.git#9d120694c5220769fd9542ef67de9d9c400a3be9"]
+  ["ache-lwt.dev" "git+https://github.com/davesnx/ache.git#9d120694c5220769fd9542ef67de9d9c400a3be9"]
 ]
 available: arch != "arm32" & arch != "x86_32"

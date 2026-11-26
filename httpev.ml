@@ -954,11 +954,11 @@ let ache_response ?(close=false) code (hdrs : (string * string) list) =
   let hdrs = if close then hdrs @ ["Connection", "close"] else hdrs in
   Ache.Response.create ?reason ~headers:(Ache.Headers.of_list hdrs) status
 
-let respond_empty ?close reqd code = Ache.Reqd.respond_with_string reqd (ache_response ?close code []) ""
+let respond_empty ?close reqd code = Ache.Request_descriptor.respond_with_string reqd (ache_response ?close code []) ""
 
 exception Drop_connection
 
-let drop_connection reqd = Ache.Reqd.report_exn reqd Drop_connection
+let drop_connection reqd = Ache.Request_descriptor.report_exn reqd Drop_connection
 
 let flush_writer writer =
   let (p,u) = Lwt.wait () in
@@ -968,10 +968,10 @@ let flush_writer writer =
   p
 
 let read_body reqd limit =
-  match Ache.Request.body_length (Ache.Reqd.request reqd) with
+  match Ache.Request.body_length (Ache.Request_descriptor.request reqd) with
   | `Fixed n when Int64.compare n (Int64.of_int limit) > 0 -> Lwt.return (Error `Too_large)
   | _ ->
-    let body = Ache.Reqd.request_body reqd in
+    let body = Ache.Request_descriptor.request_body reqd in
     let buf = Buffer.create 0 in
     let (p,u) = Lwt.wait () in
     let rec on_read bs ~off ~len =
@@ -1006,10 +1006,10 @@ let send_reply c reqd req reply =
   match body with
   | `Body s ->
     let (hdrs,s) = match code with `Ok -> maybe_gzip req.encoding hdrs s | _ -> hdrs, s in
-    Ache.Reqd.respond_with_string reqd (ache_response ~close code hdrs) s;
+    Ache.Request_descriptor.respond_with_string reqd (ache_response ~close code hdrs) s;
     Lwt.return_unit
   | `Chunks gen ->
-    let writer = Ache.Reqd.respond_with_streaming reqd (ache_response ~close code hdrs) in
+    let writer = Ache.Request_descriptor.respond_with_streaming reqd (ache_response ~close code hdrs) in
     let push = function
     | "" -> Lwt.return_unit
     | s -> Ache.Body.Writer.write_string writer s; flush_writer writer
@@ -1021,7 +1021,7 @@ let send_reply c reqd req reply =
     with exn ->
       (* do not write trailer on error - let the peer notice the breakage *)
       log #warn ~exn "generate failed";
-      Ache.Reqd.report_exn reqd exn;
+      Ache.Request_descriptor.report_exn reqd exn;
       Lwt.return_unit
 
 let handle_request_lwt c req answer =
@@ -1047,7 +1047,7 @@ let handle_request_lwt c req answer =
 
 let handle_request_ache server fd deadline sockaddr answer reqd =
   let cfg = server.config in
-  let ache_req = Ache.Reqd.request reqd in
+  let ache_req = Ache.Request_descriptor.request reqd in
   incr_total server;
   let req_id = server.total in
   let client = { fd = Lwt_unix.unix_file_descr fd; req_id; sockaddr; time_conn = Time.get (); server; req = Body_lwt 0 } in
@@ -1102,7 +1102,7 @@ let handle_request_ache server fd deadline sockaddr answer reqd =
     begin
       try%lwt process () with exn ->
         log #warn ~exn "request %s" (show_peer client);
-        Ache.Reqd.report_exn reqd exn;
+        Ache.Request_descriptor.report_exn reqd exn;
         Lwt.return_unit
     end [%lwt.finally
       Hashtbl.remove server.clients req_id;
@@ -1120,7 +1120,13 @@ let ache_error_handler server sockaddr ?request:_ error start_response =
     raise Drop_connection
   | _ ->
     incr_errors server;
-    let reason = match error with `Exn exn -> Exn.str exn | #Ache.Status.standard as s -> Ache.Status.to_string s in
+    let reason = match error with
+      | `Exn exn -> Exn.str exn
+      | `Bad_request detail -> sprintf "%s (%s)" (Ache.Status.to_string `Bad_request) detail
+      | (`Not_implemented | `Http_version_not_supported | `Uri_too_long | `Bad_gateway
+        | `Internal_server_error | `Request_header_fields_too_large | `Request_timeout as s) ->
+        Ache.Status.to_string s
+    in
     log #warn "error for %s : %s" (Nix.show_addr sockaddr) reason;
     Ache.Body.Writer.close (start_response Ache.Headers.empty)
 
@@ -1166,6 +1172,7 @@ let setup_fd_lwt fd config answer =
   let server = make_server_state (Lwt_unix.unix_file_descr fd (* will not be used *) ) config in
   let ache_config = { Ache.Config.default with max_header_size = config.max_request_size } in
   let timeout = if config.max_time.headers > 0. then Some config.max_time.headers else None in
+  let write_timeout = if config.max_time.send > 0. then Some config.max_time.send else None in
   Lwt.ignore_result begin
     while%lwt true do
       let%lwt () = Lwt_unix.sleep @@ Time.minutes 1 in
@@ -1185,7 +1192,8 @@ let setup_fd_lwt fd config answer =
       let deadline = if config.max_time.body > 0. then Some (Ache_lwt.Timeout.create config.max_time.body) else None in
       begin
         if config.nodelay then Lwt_unix.setsockopt fd TCP_NODELAY true;
-        Ache_lwt.Server.create_connection_handler ~config:ache_config ?idle_timeout:timeout ?head_timeout:timeout
+        Ache_lwt.Server.create_connection_handler ~config:ache_config ~idle_timeout:timeout ~head_timeout:timeout
+          ~body_timeout:None ~write_timeout
           ~request_handler:(fun sockaddr reqd -> handle_request_ache server fd deadline sockaddr answer reqd)
           ~error_handler:(ache_error_handler server) sockaddr fd
       end [%lwt.finally
